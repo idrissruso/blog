@@ -1,7 +1,7 @@
 import asyncio
 import random
 import weakref
-from typing import AsyncIterator, Iterable, Mapping, Sequence, Tuple, Type
+from typing import AsyncIterator, Iterable, Mapping, Optional, Sequence, Tuple, Type
 
 from redis.asyncio.client import Redis
 from redis.asyncio.connection import (
@@ -44,7 +44,7 @@ class SentinelManagedConnection(Connection):
             if str_if_bytes(await self.read_response()) != "PONG":
                 raise ConnectionError("PING failed")
 
-    async def connect(self):
+    async def _connect_retry(self):
         if self._reader:
             return  # already connected
         if self.connection_pool.is_master:
@@ -57,9 +57,22 @@ class SentinelManagedConnection(Connection):
                     continue
             raise SlaveNotFoundError  # Never be here
 
-    async def read_response(self, disable_decoding: bool = False):
+    async def connect(self):
+        return await self.retry.call_with_retry(
+            self._connect_retry,
+            lambda error: asyncio.sleep(0),
+        )
+
+    async def read_response(
+        self,
+        disable_decoding: bool = False,
+        timeout: Optional[float] = None,
+    ):
         try:
-            return await super().read_response(disable_decoding=disable_decoding)
+            return await super().read_response(
+                disable_decoding=disable_decoding,
+                timeout=timeout,
+            )
         except ReadOnlyError:
             if self.connection_pool.is_master:
                 # When talking to a master, a ReadOnlyError when likely

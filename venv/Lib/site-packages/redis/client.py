@@ -5,6 +5,7 @@ import threading
 import time
 import warnings
 from itertools import chain
+from typing import Optional
 
 from redis.commands import (
     CoreCommands,
@@ -13,6 +14,7 @@ from redis.commands import (
     list_or_args,
 )
 from redis.connection import ConnectionPool, SSLConnection, UnixDomainSocketConnection
+from redis.credentials import CredentialProvider
 from redis.exceptions import (
     ConnectionError,
     ExecAbortError,
@@ -24,6 +26,7 @@ from redis.exceptions import (
     WatchError,
 )
 from redis.lock import Lock
+from redis.retry import Retry
 from redis.utils import safe_str, str_if_bytes
 
 SYM_EMPTY = b""
@@ -850,6 +853,8 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
     the commands are sent and received to the Redis server. Based on
     configuration, an instance will either use a ConnectionPool, or
     Connection object to talk to redis.
+
+    It is not safe to pass PubSub or Pipeline objects between threads.
     """
 
     @classmethod
@@ -861,7 +866,7 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
 
             redis://[[username]:[password]]@localhost:6379/0
             rediss://[[username]:[password]]@localhost:6379/0
-            unix://[[username]:[password]]@/path/to/socket.sock?db=0
+            unix://[username@]/path/to/socket.sock?db=0[&password=password]
 
         Three URL schemes are supported:
 
@@ -936,6 +941,7 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
         username=None,
         retry=None,
         redis_connect_func=None,
+        credential_provider: Optional[CredentialProvider] = None,
     ):
         """
         Initialize a new Redis client.
@@ -943,6 +949,12 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
         `retry_on_error` to a list of the error/s to retry on, then set
         `retry` to a valid `Retry` object.
         To retry on TimeoutError, `retry_on_timeout` can also be set to `True`.
+
+        Args:
+
+        single_connection_client:
+            if `True`, connection pool is not used. In that case `Redis`
+            instance use is not thread safe.
         """
         if not connection_pool:
             if charset is not None:
@@ -977,6 +989,7 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
                 "health_check_interval": health_check_interval,
                 "client_name": client_name,
                 "redis_connect_func": redis_connect_func,
+                "credential_provider": credential_provider,
             }
             # based on input, setup appropriate connection args
             if unix_socket_path is not None:
@@ -1034,6 +1047,13 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
     def get_connection_kwargs(self):
         """Get the connection's key-word arguments"""
         return self.connection_pool.connection_kwargs
+
+    def get_retry(self) -> Optional["Retry"]:
+        return self.get_connection_kwargs().get("retry")
+
+    def set_retry(self, retry: "Retry") -> None:
+        self.get_connection_kwargs().update({"retry": retry})
+        self.connection_pool.set_retry(retry)
 
     def set_response_callback(self, command, callback):
         """Set a custom Response Callback"""
@@ -1250,12 +1270,17 @@ class Redis(AbstractRedis, RedisModuleCommands, CoreCommands, SentinelCommands):
         try:
             if NEVER_DECODE in options:
                 response = connection.read_response(disable_decoding=True)
+                options.pop(NEVER_DECODE)
             else:
                 response = connection.read_response()
         except ResponseError:
             if EMPTY_RESPONSE in options:
                 return options[EMPTY_RESPONSE]
             raise
+
+        if EMPTY_RESPONSE in options:
+            options.pop(EMPTY_RESPONSE)
+
         if command_name in self.response_callbacks:
             return self.response_callbacks[command_name](response, **options)
         return response
@@ -1495,9 +1520,15 @@ class PubSub:
 
         self.check_health()
 
-        if not block and not self._execute(conn, conn.can_read, timeout=timeout):
-            return None
-        response = self._execute(conn, conn.read_response)
+        def try_read():
+            if not block:
+                if not conn.can_read(timeout=timeout):
+                    return None
+            else:
+                conn.connect()
+            return conn.read_response()
+
+        response = self._execute(conn, try_read)
 
         if self.is_health_check_response(response):
             # ignore the health check message as user might not expect it
@@ -1623,13 +1654,13 @@ class PubSub:
             if response is not None:
                 yield response
 
-    def get_message(self, ignore_subscribe_messages=False, timeout=0):
+    def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
         """
         Get the next message if one is available, otherwise None.
 
         If timeout is specified, the system will wait for `timeout` seconds
         before returning. Timeout should be specified as a floating point
-        number.
+        number, or None, to wait indefinitely.
         """
         if not self.subscribed:
             # Wait for subscription
@@ -1645,7 +1676,7 @@ class PubSub:
                 # so no messages are available
                 return None
 
-        response = self.parse_response(block=False, timeout=timeout)
+        response = self.parse_response(block=(timeout is None), timeout=timeout)
         if response:
             return self.handle_message(response, ignore_subscribe_messages)
         return None
@@ -1850,7 +1881,7 @@ class Pipeline(Redis):
             raise RedisError("Cannot issue nested calls to MULTI")
         if self.command_stack:
             raise RedisError(
-                "Commands without an initial WATCH have already " "been issued"
+                "Commands without an initial WATCH have already been issued"
             )
         self.explicit_transaction = True
 
@@ -1873,7 +1904,7 @@ class Pipeline(Redis):
         if self.watching:
             self.reset()
             raise WatchError(
-                "A ConnectionError occurred on while " "watching one or more keys"
+                "A ConnectionError occurred on while watching one or more keys"
             )
         # if retry_on_timeout is not set, or the error is not
         # a TimeoutError, raise it
@@ -1966,7 +1997,7 @@ class Pipeline(Redis):
         if len(response) != len(commands):
             self.connection.disconnect()
             raise ResponseError(
-                "Wrong number of response items from " "pipeline execution"
+                "Wrong number of response items from pipeline execution"
             )
 
         # find any errors in the response and raise if necessary
@@ -2047,7 +2078,7 @@ class Pipeline(Redis):
         # indicates the user should retry this transaction.
         if self.watching:
             raise WatchError(
-                "A ConnectionError occurred on while " "watching one or more keys"
+                "A ConnectionError occurred on while watching one or more keys"
             )
         # if retry_on_timeout is not set, or the error is not
         # a TimeoutError, raise it
